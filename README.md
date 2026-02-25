@@ -19,6 +19,19 @@ Mistakes in manifests or submission forms are part of the learning process. Inst
 ### 4. Security & Transparency
 While we are open and welcoming, we do not compromise on safety. All submissions undergo transparent checks to ensure they are safe for end-users and respect their privacy.
 
+## 🚀 Getting Started
+
+To submit your application to **Flat Store**, please follow these steps:
+
+1. **Fork** this repository to your own GitHub account.
+2. **Switch to the `pull-request` branch** in your fork. This branch is intentionally empty to provide you with a clean start.
+3. **Add your manifest file** (e.g., `com.example.app.json`).
+4. **Open a Pull Request** from your fork's `pull-request`.
+5. **Format the PR Title** as: `Add <Flatpak ID>` (Example: `Add site.ikhlasulov.openrpm`).
+6. **Fill out the template** that appears in the description field.
+
+> **Note:** If you are new to Flatpak or GitHub, don't worry! If your build fails or you make a mistake in the manifest, our team will help you fix it. We value your contribution.
+
 ## 🤝 Join the Movement
 If you are a developer who is tired of the "gatekeeper culture," or if you have a project that was rejected elsewhere for arbitrary reasons—**you have a place here.**
 
