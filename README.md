@@ -1,4 +1,4 @@
-# Flat Store 🚀
+# Flat Store
 
 **Flat Store** is an open-source Flatpak repository and application hub built on the principles of mutual respect, progress, and accessibility. We believe that the future of software development is inclusive, and our goal is to provide a home for creators who have been pushed away by toxic gatekeeping.
 
