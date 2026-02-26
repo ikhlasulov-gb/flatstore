@@ -104,7 +104,7 @@ jobs:
           
           echo "✅ Сборка успешно завершена."
 
-      # --- ШАГ ДЕПЛОЯ ЧЕРЕЗ FTP (Debug + SSL) ---
+      # --- ШАГ ДЕПЛОЯ ЧЕРЕЗ FTP (Оптимизация скорости) ---
       - name: Deploy via FTP
         env:
           REMOTE_USER: ${{ secrets.REMOTE_USER }}
@@ -116,12 +116,11 @@ jobs:
           echo "🚀 Подключение к FTP серверу $REMOTE_HOST..."
           
           lftp -u "$REMOTE_USER","$REMOTE_PASSWORD" -p "${REMOTE_PORT:-21}" "$REMOTE_HOST" <<EOF
-          # Включаем отладку (покажет, на чем застревает)
-          debug 5
+          debug 3
           
-          # Таймауты, чтобы не висеть вечно
+          # Таймауты
           set net:timeout 10
-          set net:max-retries 1
+          set net:max-retries 2
           
           # Настройки соединения
           set ftp:passive-mode on
@@ -129,13 +128,16 @@ jobs:
           set ftp:prefer-epsv no
           set dns:order inet
           
-          # ВКЛЮЧАЕМ SSL (FTPS) - частая причина зависания обычного FTP
+          # Шифрование: только логин (контроль), данные без шифрования (для скорости)
           set ftp:ssl-allow yes
-          set ftp:ssl-protect-data yes
+          set ftp:ssl-protect-data no
+          set ftp:ssl-protect-list no
           set ssl:verify-certificate no
           
-          # Запуск зеркалирования
-          mirror -R --delete ./repo/ "$REMOTE_PATH"
+          # Опции зеркалирования для скорости
+          # --parallel=2 - качать 2 файла одновременно (ускоряет)
+          # --ignore-time - не сверять время, только наличие и размер
+          mirror -R --delete --parallel=2 --ignore-time ./repo/ "$REMOTE_PATH"
           quit
           EOF
           
