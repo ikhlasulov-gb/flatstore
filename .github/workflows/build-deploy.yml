@@ -104,7 +104,7 @@ jobs:
           
           echo "✅ Сборка успешно завершена."
 
-      # --- ШАГ ДЕПЛОЯ ЧЕРЕЗ FTP (С исправлением зависания) ---
+      # --- ШАГ ДЕПЛОЯ ЧЕРЕЗ FTP (Debug + SSL) ---
       - name: Deploy via FTP
         env:
           REMOTE_USER: ${{ secrets.REMOTE_USER }}
@@ -115,12 +115,26 @@ jobs:
         run: |
           echo "🚀 Подключение к FTP серверу $REMOTE_HOST..."
           
-          # Запускаем lftp с настройками для обхода NAT
           lftp -u "$REMOTE_USER","$REMOTE_PASSWORD" -p "${REMOTE_PORT:-21}" "$REMOTE_HOST" <<EOF
+          # Включаем отладку (покажет, на чем застревает)
+          debug 5
+          
+          # Таймауты, чтобы не висеть вечно
+          set net:timeout 10
+          set net:max-retries 1
+          
+          # Настройки соединения
           set ftp:passive-mode on
           set ftp:ignore-pasv-address yes
           set ftp:prefer-epsv no
-          set ftp:ssl-allow no
+          set dns:order inet
+          
+          # ВКЛЮЧАЕМ SSL (FTPS) - частая причина зависания обычного FTP
+          set ftp:ssl-allow yes
+          set ftp:ssl-protect-data yes
+          set ssl:verify-certificate no
+          
+          # Запуск зеркалирования
           mirror -R --delete ./repo/ "$REMOTE_PATH"
           quit
           EOF
