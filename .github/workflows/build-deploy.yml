@@ -1,7 +1,6 @@
 name: Build and Deploy Flatpak
 
 on:
-  # Ручной запуск
   workflow_dispatch:
     inputs:
       manifest_name:
@@ -13,11 +12,10 @@ on:
         required: true
         default: 'false'
       github_repo_source:
-        description: 'Репозиторий источника (для обновления, например: user/repo)'
+        description: 'Репозиторий источника (для обновления)'
         required: false
         default: ''
 
-  # Автоматический запуск при изменении манифестов
   push:
     paths:
       - 'manifests/*.json'
@@ -25,7 +23,6 @@ on:
 jobs:
   build-deploy:
     runs-on: ubuntu-latest
-    # Контейнер с инструментами flatpak-builder
     container:
       image: bilelmoussaoui/flatpak-github-actions:freedesktop-22.08
       options: --privileged
@@ -36,7 +33,8 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          dnf install -y jq rsync curl openssh
+          # Устанавливаем jq, rsync, openssh и sshpass (для пароля)
+          dnf install -y jq rsync curl openssh sshpass
 
       - name: Import GPG Key
         env:
@@ -44,13 +42,10 @@ jobs:
         run: |
           echo "$GPG_PRIVATE_KEY" | gpg --import --batch --passphrase "" 2>/dev/null || true
 
-      # --- ШАГ: Добавление Flathub ---
-      # Этот шаг добавляет репозиторий, чтобы flatpak-builder мог найти SDK, указанный в манифесте
       - name: Add Flathub Repository
         run: |
           flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
 
-      # --- ШАГ: Автообновление (если включено) ---
       - name: Update Manifest Version
         if: github.event.inputs.run_update == 'true'
         env:
@@ -60,7 +55,6 @@ jobs:
           chmod +x scripts/update_manifest.sh
           ./scripts/update_manifest.sh "$SOURCE_REPO" "manifests/$MANIFEST_NAME"
 
-      # --- ШАГ: Определение манифеста ---
       - name: Determine Manifest to Build
         id: vars
         env:
@@ -69,7 +63,6 @@ jobs:
           if [ -n "$INPUT_MANIFEST" ]; then
             MANIFEST_PATH="manifests/$INPUT_MANIFEST"
           else
-            # Если это push, берем первый найденный файл
             MANIFEST_PATH=$(ls manifests/*.json | head -n 1)
             echo "Обнаружен измененный манифест: $MANIFEST_PATH"
           fi
@@ -80,12 +73,9 @@ jobs:
           fi
           
           echo "manifest_path=$MANIFEST_PATH" >> $GITHUB_OUTPUT
-          
-          # Извлекаем ID приложения
           APP_ID=$(jq -r '.id // ."app-id"' "$MANIFEST_PATH")
           echo "app_id=$APP_ID" >> $GITHUB_OUTPUT
 
-      # --- ШАГ: Сборка ---
       - name: Build and Sign Flatpak
         env:
           GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
@@ -95,13 +85,9 @@ jobs:
           
           echo "🔨 Начинаем сборку: $APP_ID"
           
-          # Ключевой момент: --install-deps-from=flathub автоматически скачает нужный SDK (например, 49-й)
           flatpak-builder --repo=repo --force-clean --gpg-sign=$GPG_KEY_ID --install-deps-from=flathub build-dir "$MANIFEST"
-          
-          # Обновление метаданных репозитория
           flatpak build-update-repo --generate-static-deltas --gpg-sign=$GPG_KEY_ID --title="Flat Store" repo
           
-          # Генерация .flatpakref
           GPG_PUBLIC_DATA=$(gpg --export --armor $GPG_KEY_ID | base64 -w 0)
           mkdir -p repo/apps
           FLATPAKREF_FILE="repo/apps/$(basename "$APP_ID" | tr '.' '-').flatpakref"
@@ -119,21 +105,25 @@ jobs:
           
           echo "✅ Сборка успешно завершена."
 
-      # --- ШАГ: Деплой ---
+      # --- ИСПРАВЛЕННЫЙ ШАГ ДЕПЛОЯ (С ПАРОЛЕМ И ПОРТОМ) ---
       - name: Deploy to Server
         env:
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           REMOTE_USER: ${{ secrets.REMOTE_USER }}
           REMOTE_HOST: ${{ secrets.REMOTE_HOST }}
           REMOTE_PATH: ${{ secrets.REMOTE_PATH }}
+          REMOTE_PORT: ${{ secrets.REMOTE_PORT }} # Убедитесь, что секрет равен 64000
+          REMOTE_PASSWORD: ${{ secrets.REMOTE_PASSWORD }} # Ваш пароль от cPanel
         run: |
-          mkdir -p ~/.ssh
-          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
+          echo "🚀 Подключение к $REMOTE_HOST:$REMOTE_PORT..."
           
-          # Добавляем ключ хоста
-          ssh-keyscan -H $REMOTE_HOST >> ~/.ssh/known_hosts
+          # Переменная для пароля, чтобы sshpass ее увидел
+          export SSHPASS="$REMOTE_PASSWORD"
           
-          echo "🚀 Загрузка файлов на сервер $REMOTE_HOST..."
-          rsync -avz --delete ./repo/ $REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH/
+          # 1. Проверка соединения (используем sshpass и строгий порт)
+          sshpass -e ssh -o StrictHostKeyChecking=no -p "$REMOTE_PORT" $REMOTE_USER@$REMOTE_HOST "echo '✅ SSH соединение установлено успешно!'" || { echo "❌ Ошибка подключения. Проверьте логин, пароль и порт."; exit 1; }
+          
+          echo "📦 Загрузка файлов..."
+          # 2. Синхронизация файлов (sshpass автоматически передаст пароль)
+          sshpass -e rsync -avz -e "ssh -o StrictHostKeyChecking=no -p $REMOTE_PORT" --delete ./repo/ $REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH/
+          
           echo "🎉 Деплой завершен! Приложение доступно на сайте."
