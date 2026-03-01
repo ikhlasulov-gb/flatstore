@@ -30,8 +30,8 @@
         {
           "type": "git",
           "url": "https://github.com/ikhlasulov-gb/open-rpm-gtk.git",
-          "tag": "v1.0.2",
-          "commit": "c759e4001ede7d68d61616e0fbfdae608c584ab3",
+          "tag": "v1.0.3",
+          "commit": "b0191e1b3222a1d3ba15fd2ea6ccdd8185f636f6",
           "x-checker-data": {
             "type": "git",
             "tag-pattern": "^v(\\d+\\.\\d+\\.\\d+)$"
