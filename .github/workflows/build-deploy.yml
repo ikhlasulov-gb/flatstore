@@ -33,7 +33,6 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          # Устанавливаем lftp и другие необходимые инструменты
           dnf install -y jq rsync curl openssh lftp
 
       - name: Import GPG Key
@@ -82,18 +81,21 @@ jobs:
           MANIFEST="${{ steps.vars.outputs.manifest_path }}"
           APP_ID="${{ steps.vars.outputs.app_id }}"
           
-          echo "🔨 Начинаем сборку: $APP_ID"
+          echo "🔨 Начинаем сборку: $APP_ID (branch: stable)"
           
-          flatpak-builder --repo=repo --force-clean --gpg-sign=$GPG_KEY_ID --install-deps-from=flathub build-dir "$MANIFEST"
+          # Добавлен флаг --default-branch=stable
+          flatpak-builder --repo=repo --force-clean --gpg-sign=$GPG_KEY_ID --install-deps-from=flathub --default-branch=stable build-dir "$MANIFEST"
+          
           flatpak build-update-repo --generate-static-deltas --gpg-sign=$GPG_KEY_ID --title="Flat Store" repo
           
           GPG_PUBLIC_DATA=$(gpg --export --armor $GPG_KEY_ID | base64 -w 0)
           mkdir -p repo/apps
           FLATPAKREF_FILE="repo/apps/$(basename "$APP_ID" | tr '.' '-').flatpakref"
           
+          # Здесь изменено /master на /stable
           cat <<EOF > "$FLATPAKREF_FILE"
           [Flatpak Ref]
-          Name=$APP_ID/x86_64/master
+          Name=$APP_ID/x86_64/stable
           RepoName=Flat Store
           Url=https://flatstore.ikhlasulov.site/flatstore/
           RuntimeRepo=https://dl.flathub.org/repo/flathub.flatpakrepo
@@ -104,7 +106,6 @@ jobs:
           
           echo "✅ Сборка успешно завершена."
 
-      # --- ШАГ ДЕПЛОЯ ЧЕРЕЗ FTP (Оптимизация скорости) ---
       - name: Deploy via FTP
         env:
           REMOTE_USER: ${{ secrets.REMOTE_USER }}
@@ -117,26 +118,16 @@ jobs:
           
           lftp -u "$REMOTE_USER","$REMOTE_PASSWORD" -p "${REMOTE_PORT:-21}" "$REMOTE_HOST" <<EOF
           debug 3
-          
-          # Таймауты
           set net:timeout 10
           set net:max-retries 2
-          
-          # Настройки соединения
           set ftp:passive-mode on
           set ftp:ignore-pasv-address yes
           set ftp:prefer-epsv no
           set dns:order inet
-          
-          # Шифрование: только логин (контроль), данные без шифрования (для скорости)
           set ftp:ssl-allow yes
           set ftp:ssl-protect-data no
           set ftp:ssl-protect-list no
           set ssl:verify-certificate no
-          
-          # Опции зеркалирования для скорости
-          # --parallel=2 - качать 2 файла одновременно (ускоряет)
-          # --ignore-time - не сверять время, только наличие и размер
           mirror -R --delete --parallel=2 --ignore-time ./repo/ "$REMOTE_PATH"
           quit
           EOF
