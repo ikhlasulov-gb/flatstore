@@ -166,6 +166,26 @@ jobs:
 
           echo "📦 Создание метаданных репозитория..."
 
+          # Проверяем GPG ключ
+          if [ -n "$GPG_KEY_ID" ]; then
+            echo "🔐 GPG_KEY_ID: $GPG_KEY_ID"
+
+            # Проверяем что ключ импортирован
+            if gpg --list-keys "$GPG_KEY_ID" > /dev/null 2>&1; then
+              echo "✅ GPG ключ найден в keyring"
+
+              # Показываем fingerprint для проверки
+              echo "📋 Fingerprint ключа:"
+              gpg --fingerprint "$GPG_KEY_ID" 2>/dev/null | head -4
+            else
+              echo "❌ GPG ключ НЕ найден в keyring!"
+              echo "📋 Доступные ключи:"
+              gpg --list-keys --keyid-format LONG 2>/dev/null
+            fi
+          else
+            echo "⚠️ GPG_KEY_ID не установлен"
+          fi
+
           # Создаём summary с подписью
           if [ -n "$GPG_KEY_ID" ]; then
             flatpak build-update-repo \
@@ -182,7 +202,15 @@ jobs:
           # Создаём flatpakref файл для приложения
           GPG_PUBLIC_DATA=""
           if [ -n "$GPG_KEY_ID" ]; then
-            GPG_PUBLIC_DATA=$(gpg --export --armor $GPG_KEY_ID 2>/dev/null | base64 -w 0)
+            GPG_PUBLIC_DATA=$(gpg --export --armor "$GPG_KEY_ID" 2>/dev/null | base64 -w 0)
+            
+            if [ -n "$GPG_PUBLIC_DATA" ]; then
+              echo "✅ GPG публичный ключ экспортирован (${#GPG_PUBLIC_DATA} символов)"
+              # Показываем начало ключа для сверки
+              echo "📋 Начало ключа: ${GPG_PUBLIC_DATA:0:50}..."
+            else
+              echo "❌ Не удалось экспортировать GPG публичный ключ!"
+            fi
           fi
 
           # flatpakrepo файл (для добавления remote)
@@ -434,19 +462,31 @@ jobs:
 
           echo "🔍 Проверка деплоя по HTTP..."
 
-          # Функция проверки HTTP
+          # Получаем локальный commit (ожидаемое значение)
+          LOCAL_COMMIT=$(cat "repo/refs/heads/app/$APP_ID/x86_64/$FLATPAK_BRANCH" 2>/dev/null | tr -d '\n\r')
+          echo "📋 Локальный commit: ${LOCAL_COMMIT:0:12}..."
+
+          # Функция проверки HTTP с повторами
           check_url() {
             local url="$1"
             local name="$2"
-            local code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 30 "$url" 2>/dev/null || echo "000")
+            local retries="${3:-1}"
+            local delay="${4:-5}"
 
-            if [ "$code" = "200" ]; then
-              echo "  ✅ $name (HTTP $code)"
-              return 0
-            else
-              echo "  ❌ $name (HTTP $code)"
-              return 1
-            fi
+            for i in $(seq 1 $retries); do
+              local code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 30 "$url" 2>/dev/null || echo "000")
+
+              if [ "$code" = "200" ]; then
+                echo "  ✅ $name (HTTP $code)"
+                return 0
+              elif [ $i -lt $retries ]; then
+                echo "  ⏳ $name (HTTP $code) - попытка $i/$retries, ждём ${delay}s..."
+                sleep $delay
+              else
+                echo "  ❌ $name (HTTP $code)"
+                return 1
+              fi
+            done
           }
 
           echo ""
@@ -459,17 +499,31 @@ jobs:
 
           # Проверяем ref приложения
           REF_URL="$BASE_URL/refs/heads/app/$APP_ID/x86_64/$FLATPAK_BRANCH"
-          if check_url "$REF_URL" "ref приложения"; then
-            # Получаем хеш коммита
-            COMMIT=$(curl -s "$REF_URL" 2>/dev/null | tr -d '\n\r')
+          if check_url "$REF_URL" "ref приложения" 3 5; then
+            # Получаем хеш коммита с сервера
+            REMOTE_COMMIT=$(curl -s "$REF_URL" 2>/dev/null | tr -d '\n\r')
 
-            if [ -n "$COMMIT" ] && [[ "$COMMIT" =~ ^[0-9a-f]{64}$ ]]; then
-              echo "     Commit: ${COMMIT:0:12}..."
+            if [ -n "$REMOTE_COMMIT" ] && [[ "$REMOTE_COMMIT" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "     Commit на сервере: ${REMOTE_COMMIT:0:12}..."
+
+              # Сравниваем с локальным
+              if [ "$REMOTE_COMMIT" = "$LOCAL_COMMIT" ]; then
+                echo "     ✅ Commit совпадает с локальным"
+              else
+                echo "     ❌ НЕСОВПАДЕНИЕ! Локальный: ${LOCAL_COMMIT:0:12}..."
+                echo "     Возможная причина: кэширование сервера или неполная синхронизация FTP"
+              fi
 
               # Проверяем commit объект
-              COMMIT_URL="$BASE_URL/objects/${COMMIT:0:2}/${COMMIT:2}.commit"
-              check_url "$COMMIT_URL" "commit объект" || echo "     ⚠️ Если ошибка - подождите несколько минут и повторите"
+              COMMIT_URL="$BASE_URL/objects/${REMOTE_COMMIT:0:2}/${REMOTE_COMMIT:2}.commit"
+              if check_url "$COMMIT_URL" "commit объект" 3 5; then
+                echo "     ✅ Репозиторий полностью синхронизирован"
+              else
+                echo "     ❌ Commit объект не найден на сервере!"
+              fi
             fi
+          else
+            echo "  ❌ Ref приложения недоступен"
           fi
 
           echo ""
@@ -478,6 +532,7 @@ jobs:
           echo "═══════════════════════════════════════════════════════"
           echo ""
           echo "📦 Для установки:"
+          echo "   flatpak remote-delete flatstore --force 2>/dev/null || true"
           echo "   flatpak remote-add --if-not-exists flatstore \\"
           echo "       https://flatstore.ikhlasulov.site/flatstore/flatstore.flatpakrepo"
           echo "   flatpak install $APP_ID"
