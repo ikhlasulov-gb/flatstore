@@ -386,7 +386,6 @@ jobs:
           REMOTE_PORT: ${{ secrets.REMOTE_PORT }}
         run: |
           APP_ID="${{ steps.vars.outputs.app_id }}"
-          REMOTE_PATH_ESCAPED=$(echo "$REMOTE_PATH" | sed 's/\$/\\$/g')
 
           echo "🚀 Деплой на $REMOTE_HOST"
           echo "📅 Время: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
@@ -394,51 +393,20 @@ jobs:
           echo "📂 Удалённый путь: $REMOTE_PATH"
           echo "🔌 Порт: ${REMOTE_PORT:-21}"
 
-          # Создаём файл с командами lftp
-          cat > /tmp/lftp_commands.txt << EOF
-          set net:timeout 10
-          set net:max-retries 2
-          set ftp:passive-mode on
-          set ftp:ignore-pasv-address yes
-          set ftp:prefer-epsv no
-          set dns:order inet
-          set ftp:ssl-allow yes
-          set ftp:ssl-protect-data no
-          set ftp:ssl-protect-list no
-          set ssl:verify-certificate no
-          mirror -R --delete --parallel=2 --ignore-time ./repo/ $REMOTE_PATH
-          quit
-          EOF
-
-          # Убираем лишние пробелы в начале строк
-          sed -i 's/^[[:space:]]*//' /tmp/lftp_commands.txt
-
           echo ""
           echo "Попытка подключения..."
 
-          lftp -u "$REMOTE_USER","$REMOTE_PASSWORD" -p "${REMOTE_PORT:-21}" "$REMOTE_HOST" -f /tmp/lftp_commands.txt
+          # Используем -e для передачи команд (поддерживается всеми версиями lftp)
+          lftp -e "set net:timeout 10; set net:max-retries 2; set ftp:passive-mode on; set ftp:ignore-pasv-address yes; set ftp:prefer-epsv no; set dns:order inet; set ftp:ssl-allow yes; set ftp:ssl-protect-data no; set ftp:ssl-protect-list no; set ssl:verify-certificate no; mirror -R --delete --parallel=2 --ignore-time ./repo/ $REMOTE_PATH; quit" -u "$REMOTE_USER","$REMOTE_PASSWORD" -p "${REMOTE_PORT:-21}" "$REMOTE_HOST"
+
           DEPLOY_STATUS=$?
 
-          # Если не удалось - пробуем альтернативные настройки
           if [ $DEPLOY_STATUS -ne 0 ]; then
             echo ""
-            echo "⚠️ Первая попытка неудачна, пробуем активный режим FTP..."
+            echo "⚠️ Первая попытка неудачна, пробуем альтернативный режим..."
 
-            cat > /tmp/lftp_commands2.txt << EOF
-            set net:timeout 15
-            set net:max-retries 3
-            set ftp:passive-mode off
-            set ftp:ignore-pasv-address no
-            set ftp:prefer-epsv yes
-            set dns:order inet
-            set ftp:ssl-allow no
-            mirror -R --delete --parallel=1 ./repo/ $REMOTE_PATH
-            quit
-            EOF
+            lftp -e "set net:timeout 15; set net:max-retries 3; set ftp:passive-mode off; set ftp:ignore-pasv-address no; set ftp:prefer-epsv yes; set dns:order inet; set ftp:ssl-allow no; mirror -R --delete --parallel=1 ./repo/ $REMOTE_PATH; quit" -u "$REMOTE_USER","$REMOTE_PASSWORD" -p "${REMOTE_PORT:-21}" "$REMOTE_HOST"
 
-            sed -i 's/^[[:space:]]*//' /tmp/lftp_commands2.txt
-
-            lftp -u "$REMOTE_USER","$REMOTE_PASSWORD" -p "${REMOTE_PORT:-21}" "$REMOTE_HOST" -f /tmp/lftp_commands2.txt
             DEPLOY_STATUS=$?
           fi
 
