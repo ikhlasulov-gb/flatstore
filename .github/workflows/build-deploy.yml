@@ -50,12 +50,36 @@ jobs:
       - name: Import GPG Key
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
         run: |
-          if [ -n "$GPG_PRIVATE_KEY" ]; then
-            echo "$GPG_PRIVATE_KEY" | gpg --import --batch --passphrase "" 2>/dev/null || true
-            echo "✅ GPG ключ импортирован"
+          if [ -z "$GPG_PRIVATE_KEY" ]; then
+            echo "⚠️ GPG_PRIVATE_KEY не установлен в secrets"
+            exit 0
+          fi
+
+          if [ -z "$GPG_KEY_ID" ]; then
+            echo "⚠️ GPG_KEY_ID не установлен в secrets"
+            exit 0
+          fi
+
+          echo "🔐 Импорт GPG ключа..."
+
+          # Создаём файл с ключом (надёжнее чем pipe)
+          echo "$GPG_PRIVATE_KEY" > /tmp/private.key
+
+          # Импортируем ключ
+          gpg --import --batch --passphrase "" /tmp/private.key 2>&1
+
+          # Удаляем временный файл
+          rm -f /tmp/private.key
+
+          # Проверяем что ключ импортирован
+          if gpg --list-keys "$GPG_KEY_ID" > /dev/null 2>&1; then
+            echo "✅ GPG ключ импортирован: $GPG_KEY_ID"
           else
-            echo "⚠️ GPG ключ не найден в secrets"
+            echo "❌ Ошибка: GPG ключ не найден после импорта"
+            gpg --list-keys
+            exit 1
           fi
 
       - name: Add Flathub Repository
@@ -107,6 +131,8 @@ jobs:
       # СБОРКА
       # ========================================
       - name: Build Flatpak
+        env:
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
         run: |
           MANIFEST="${{ steps.vars.outputs.manifest_path }}"
           APP_ID="${{ steps.vars.outputs.app_id }}"
@@ -114,12 +140,18 @@ jobs:
           echo "🔨 Сборка: $APP_ID (branch: $FLATPAK_BRANCH)"
           echo "📅 Время: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
-          flatpak-builder \
-            --repo=repo \
-            --force-clean \
-            --install-deps-from=flathub \
-            --default-branch=$FLATPAK_BRANCH \
-            build-dir "$MANIFEST"
+          # Базовые параметры сборки
+          BUILD_ARGS="--repo=repo --force-clean --install-deps-from=flathub --default-branch=$FLATPAK_BRANCH"
+
+          # Добавляем GPG подпись если есть ключ
+          if [ -n "$GPG_KEY_ID" ]; then
+            BUILD_ARGS="$BUILD_ARGS --gpg-sign=$GPG_KEY_ID"
+            echo "🔐 GPG подпись включена: $GPG_KEY_ID"
+          else
+            echo "⚠️ GPG подпись отключена (GPG_KEY_ID не установлен)"
+          fi
+
+          flatpak-builder $BUILD_ARGS build-dir "$MANIFEST"
 
           echo "✅ Сборка завершена"
 
@@ -153,10 +185,41 @@ jobs:
             GPG_PUBLIC_DATA=$(gpg --export --armor $GPG_KEY_ID 2>/dev/null | base64 -w 0)
           fi
 
+          # flatpakrepo файл (для добавления remote)
+          FLATPAKREPO_FILE="repo/flatstore.flatpakrepo"
+
+          if [ -n "$GPG_KEY_ID" ] && [ -n "$GPG_PUBLIC_DATA" ]; then
+            # С GPG подписью
+            cat <<EOF > "$FLATPAKREPO_FILE"
+          [Flatpak Repo]
+          Title=Flat Store
+          Url=https://flatstore.ikhlasulov.site/flatstore/
+          Homepage=https://flatstore.ikhlasulov.site/
+          Nodebug=true
+          Noenumerate=false
+          GPGKey=$GPG_PUBLIC_DATA
+          EOF
+            echo "✅ flatpakrepo создан с GPG ключом"
+          else
+            # Без GPG подписи
+            cat <<EOF > "$FLATPAKREPO_FILE"
+          [Flatpak Repo]
+          Title=Flat Store
+          Url=https://flatstore.ikhlasulov.site/flatstore/
+          Homepage=https://flatstore.ikhlasulov.site/
+          Nodebug=true
+          Noenumerate=false
+          GPGVerify=false
+          EOF
+            echo "⚠️ flatpakrepo создан БЕЗ GPG ключа (gpg-verify=false)"
+          fi
+
+          # flatpakref файл для приложения
           mkdir -p repo/apps
           FLATPAKREF_FILE="repo/apps/$(echo "$APP_ID" | tr '.' '-').flatpakref"
 
-          cat <<EOF > "$FLATPAKREF_FILE"
+          if [ -n "$GPG_KEY_ID" ] && [ -n "$GPG_PUBLIC_DATA" ]; then
+            cat <<EOF > "$FLATPAKREF_FILE"
           [Flatpak Ref]
           Name=$APP_ID/x86_64/$FLATPAK_BRANCH
           RepoName=Flat Store
@@ -164,8 +227,19 @@ jobs:
           RuntimeRepo=https://dl.flathub.org/repo/flathub.flatpakrepo
           IsRuntime=false
           SuggestRemoteName=flatstore
-          ${GPG_PUBLIC_DATA:+GPGKey=$GPG_PUBLIC_DATA}
+          GPGKey=$GPG_PUBLIC_DATA
           EOF
+          else
+            cat <<EOF > "$FLATPAKREF_FILE"
+          [Flatpak Ref]
+          Name=$APP_ID/x86_64/$FLATPAK_BRANCH
+          RepoName=Flat Store
+          Url=https://flatstore.ikhlasulov.site/flatstore/
+          RuntimeRepo=https://dl.flathub.org/repo/flathub.flatpakrepo
+          IsRuntime=false
+          SuggestRemoteName=flatstore
+          EOF
+          fi
 
           echo "✅ flatpakref создан: $FLATPAKREF_FILE"
 
@@ -317,14 +391,16 @@ jobs:
           echo "📅 Время: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           echo "📦 Приложение: $APP_ID"
           echo "📂 Удалённый путь: $REMOTE_PATH"
+          echo "🔌 Порт: ${REMOTE_PORT:-21}"
 
-          # Полная синхронизация с удалением старых файлов
+          # ВАРИАНТ 1: Оригинальные настройки (как в вашем рабочем workflow)
+          echo ""
+          echo "Попытка подключения с оригинальными настройками..."
+
           lftp -u "$REMOTE_USER","$REMOTE_PASSWORD" -p "${REMOTE_PORT:-21}" "$REMOTE_HOST" <<LFTP_SCRIPT
           debug 3
-          set net:timeout 30
-          set net:max-retries 3
-          set net:reconnect-interval-base 5
-          set net:reconnect-interval-multiplier 2
+          set net:timeout 10
+          set net:max-retries 2
           set ftp:passive-mode on
           set ftp:ignore-pasv-address yes
           set ftp:prefer-epsv no
@@ -333,19 +409,45 @@ jobs:
           set ftp:ssl-protect-data no
           set ftp:ssl-protect-list no
           set ssl:verify-certificate no
-
-          # Создаём директорию если не существует
-          mkdir -p "$REMOTE_PATH"
-
-          # Полная синхронизация с удалением старых файлов
           mirror -R --delete --parallel=2 --ignore-time ./repo/ "$REMOTE_PATH"
-
           quit
           LFTP_SCRIPT
 
           DEPLOY_STATUS=$?
+
+          # Если не удалось - пробуем альтернативные настройки
           if [ $DEPLOY_STATUS -ne 0 ]; then
+            echo ""
+            echo "⚠️ Первая попытка неудачна, пробуем активный режим FTP..."
+
+            lftp -u "$REMOTE_USER","$REMOTE_PASSWORD" -p "${REMOTE_PORT:-21}" "$REMOTE_HOST" <<LFTP_SCRIPT
+            debug 3
+            set net:timeout 15
+            set net:max-retries 3
+            set ftp:passive-mode off
+            set ftp:ignore-pasv-address no
+            set ftp:prefer-epsv yes
+            set dns:order inet
+            set ftp:ssl-allow no
+            mirror -R --delete --parallel=1 ./repo/ "$REMOTE_PATH"
+            quit
+            LFTP_SCRIPT
+
+            DEPLOY_STATUS=$?
+          fi
+
+          if [ $DEPLOY_STATUS -ne 0 ]; then
+            echo ""
             echo "❌ Ошибка деплоя: $DEPLOY_STATUS"
+            echo ""
+            echo "💡 Возможные причины:"
+            echo "   • IP GitHub Actions заблокирован хостингом"
+            echo "   • Сервер недоступен"
+            echo "   • Неверный порт или хост"
+            echo ""
+            echo "📋 Проверьте:"
+            echo "   • Secrets: REMOTE_HOST, REMOTE_PORT"
+            echo "   • Доступность сервера с вашего ПК"
             exit 1
           fi
 
