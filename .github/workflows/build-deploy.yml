@@ -414,57 +414,54 @@ jobs:
           REMOTE_PORT: ${{ secrets.REMOTE_PORT }}
         run: |
           APP_ID="${{ steps.vars.outputs.app_id }}"
+          FTP_PORT="${REMOTE_PORT:-21}"
 
           echo "🚀 Деплой на $REMOTE_HOST"
           echo "📅 Время: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           echo "📦 Приложение: $APP_ID"
           echo "📂 Удалённый путь: $REMOTE_PATH"
-          echo "🔌 Порт: ${REMOTE_PORT:-21}"
+          echo "🔌 Порт: $FTP_PORT"
 
           echo ""
           echo "Проверка подключения к серверу..."
           
           # Проверяем доступность хоста
-          if timeout 10 bash -c "cat < /dev/null > /dev/tcp/$REMOTE_HOST/${REMOTE_PORT:-21}" 2>/dev/null; then
-            echo "✅ Порт ${REMOTE_PORT:-21} доступен"
+          if timeout 10 bash -c "cat < /dev/null > /dev/tcp/$REMOTE_HOST/$FTP_PORT" 2>/dev/null; then
+            echo "✅ Порт $FTP_PORT доступен"
           else
-            echo "❌ Порт ${REMOTE_PORT:-21} недоступен!"
-            echo "   Возможные причины:"
-            echo "   • IP GitHub заблокирован хостингом"
-            echo "   • Неверный хост или порт"
+            echo "❌ Порт $FTP_PORT недоступен!"
             exit 1
           fi
 
           echo ""
           echo "Попытка подключения к FTP..."
 
-          # Создаём конфигурационный файл для lftp
+          # Создаём конфигурационный файл для lftp (без heredoc)
           mkdir -p ~/.lftp
-          cat > ~/.lftp/rc << 'LFTPRC'
-          set net:timeout 30
-          set net:max-retries 5
-          set net:reconnect-interval-base 5
-          set net:reconnect-interval-multiplier 1
-          set ftp:passive-mode on
-          set ftp:ignore-pasv-address yes
-          set ftp:prefer-epsv no
-          set dns:order inet
-          set ftp:ssl-allow yes
-          set ftp:ssl-protect-data no
-          set ftp:ssl-protect-list no
-          set ssl:verify-certificate no
-          set mirror:use-pget-n 1
-          LFTPRC
+          echo "set net:timeout 30" > ~/.lftp/rc
+          echo "set net:max-retries 5" >> ~/.lftp/rc
+          echo "set net:reconnect-interval-base 5" >> ~/.lftp/rc
+          echo "set net:reconnect-interval-multiplier 1" >> ~/.lftp/rc
+          echo "set ftp:passive-mode on" >> ~/.lftp/rc
+          echo "set ftp:ignore-pasv-address yes" >> ~/.lftp/rc
+          echo "set ftp:prefer-epsv no" >> ~/.lftp/rc
+          echo "set dns:order inet" >> ~/.lftp/rc
+          echo "set ftp:ssl-allow yes" >> ~/.lftp/rc
+          echo "set ftp:ssl-protect-data no" >> ~/.lftp/rc
+          echo "set ftp:ssl-protect-list no" >> ~/.lftp/rc
+          echo "set ssl:verify-certificate no" >> ~/.lftp/rc
+          echo "set mirror:use-pget-n 1" >> ~/.lftp/rc
 
           echo "Конфигурация lftp создана"
 
-          # Пробуем подключиться и загрузить
-          lftp -c "
-            open -u $REMOTE_USER,$REMOTE_PASSWORD -p ${REMOTE_PORT:-21} $REMOTE_HOST
-            mirror -R --delete --parallel=1 --ignore-time ./repo/ $REMOTE_PATH
-            quit
-          " 2>&1
+          # Создаём скрипт команд lftp
+          LFTP_SCRIPT="/tmp/lftp_upload.lftp"
+          echo "open -u $REMOTE_USER,$REMOTE_PASSWORD -p $FTP_PORT $REMOTE_HOST" > "$LFTP_SCRIPT"
+          echo "mirror -R --delete --parallel=1 --ignore-time ./repo/ $REMOTE_PATH" >> "$LFTP_SCRIPT"
+          echo "quit" >> "$LFTP_SCRIPT"
 
+          echo "Запуск lftp..."
+          lftp -f "$LFTP_SCRIPT" 2>&1
           DEPLOY_STATUS=$?
 
           if [ $DEPLOY_STATUS -ne 0 ]; then
@@ -473,35 +470,22 @@ jobs:
             echo "Пробуем активный режим без SSL..."
 
             # Альтернативная конфигурация
-            cat > ~/.lftp/rc << 'LFTPRC'
-            set net:timeout 30
-            set net:max-retries 5
-            set ftp:passive-mode off
-            set ftp:ignore-pasv-address no
-            set ftp:prefer-epsv yes
-            set dns:order inet
-            set ftp:ssl-allow no
-            set mirror:use-pget-n 1
-            LFTPRC
+            echo "set net:timeout 30" > ~/.lftp/rc
+            echo "set net:max-retries 5" >> ~/.lftp/rc
+            echo "set ftp:passive-mode off" >> ~/.lftp/rc
+            echo "set ftp:ignore-pasv-address no" >> ~/.lftp/rc
+            echo "set ftp:prefer-epsv yes" >> ~/.lftp/rc
+            echo "set dns:order inet" >> ~/.lftp/rc
+            echo "set ftp:ssl-allow no" >> ~/.lftp/rc
+            echo "set mirror:use-pget-n 1" >> ~/.lftp/rc
 
-            lftp -c "
-              open -u $REMOTE_USER,$REMOTE_PASSWORD -p ${REMOTE_PORT:-21} $REMOTE_HOST
-              mirror -R --delete --parallel=1 ./repo/ $REMOTE_PATH
-              quit
-            " 2>&1
-
+            lftp -f "$LFTP_SCRIPT" 2>&1
             DEPLOY_STATUS=$?
           fi
 
           if [ $DEPLOY_STATUS -ne 0 ]; then
             echo ""
             echo "❌ Ошибка деплоя: $DEPLOY_STATUS"
-            echo ""
-            echo "💡 Возможные причины:"
-            echo "   • IP GitHub Actions заблокирован хостингом"
-            echo "   • Недостаточно места на сервере"
-            echo "   • Проблемы с правами доступа"
-            echo "   • Неверные учетные данные"
             exit 1
           fi
 
