@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       manifest_name:
-        description: 'Имя файла манифеста (например: com.app.MyApp.json)'
+        description: 'Имя файла манифеста (например: site.ikhlasulov.openrpm.json)'
         required: true
         default: ''
       run_update:
@@ -15,10 +15,18 @@ on:
         description: 'Репозиторий источника (для обновления)'
         required: false
         default: ''
+      skip_verification:
+        description: 'Пропустить верификацию? (не рекомендуется)'
+        required: false
+        default: 'false'
 
   push:
     paths:
       - 'manifests/*.json'
+      - 'scripts/*.sh'
+
+env:
+  FLATPAK_BRANCH: stable
 
 jobs:
   build-deploy:
@@ -33,13 +41,22 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          dnf install -y jq rsync curl openssh lftp
+          dnf install -y jq rsync curl openssh-clients lftp findutils
+
+      - name: Make scripts executable
+        run: |
+          chmod +x scripts/*.sh 2>/dev/null || true
 
       - name: Import GPG Key
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
         run: |
-          echo "$GPG_PRIVATE_KEY" | gpg --import --batch --passphrase "" 2>/dev/null || true
+          if [ -n "$GPG_PRIVATE_KEY" ]; then
+            echo "$GPG_PRIVATE_KEY" | gpg --import --batch --passphrase "" 2>/dev/null || true
+            echo "✅ GPG ключ импортирован"
+          else
+            echo "⚠️ GPG ключ не найден в secrets"
+          fi
 
       - name: Add Flathub Repository
         run: |
@@ -51,8 +68,11 @@ jobs:
           MANIFEST_NAME: ${{ github.event.inputs.manifest_name }}
           SOURCE_REPO: ${{ github.event.inputs.github_repo_source }}
         run: |
-          chmod +x scripts/update_manifest.sh
-          ./scripts/update_manifest.sh "$SOURCE_REPO" "manifests/$MANIFEST_NAME"
+          if [ -f "scripts/update_manifest.sh" ]; then
+            ./scripts/update_manifest.sh "$SOURCE_REPO" "manifests/$MANIFEST_NAME"
+          else
+            echo "⚠️ Скрипт update_manifest.sh не найден"
+          fi
 
       - name: Determine Manifest to Build
         id: vars
@@ -62,51 +82,228 @@ jobs:
           if [ -n "$INPUT_MANIFEST" ]; then
             MANIFEST_PATH="manifests/$INPUT_MANIFEST"
           else
-            MANIFEST_PATH=$(ls manifests/*.json | head -n 1)
+            MANIFEST_PATH=$(ls manifests/*.json 2>/dev/null | head -n 1)
           fi
-          
-          if [ ! -f "$MANIFEST_PATH" ]; then
-            echo "Ошибка: Манифест $MANIFEST_PATH не найден!"
+
+          if [ -z "$MANIFEST_PATH" ] || [ ! -f "$MANIFEST_PATH" ]; then
+            echo "❌ Ошибка: Манифест не найден!"
+            ls -la manifests/ 2>/dev/null || echo "Директория manifests/ не существует"
             exit 1
           fi
-          
-          echo "manifest_path=$MANIFEST_PATH" >> $GITHUB_OUTPUT
-          APP_ID=$(jq -r '.id // ."app-id"' "$MANIFEST_PATH")
-          echo "app_id=$APP_ID" >> $GITHUB_OUTPUT
 
-      - name: Build and Sign Flatpak
-        env:
-          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+          echo "manifest_path=$MANIFEST_PATH" >> $GITHUB_OUTPUT
+
+          APP_ID=$(jq -r '.id // ."app-id"' "$MANIFEST_PATH")
+          if [ -z "$APP_ID" ] || [ "$APP_ID" = "null" ]; then
+            echo "❌ Не удалось определить ID приложения"
+            exit 1
+          fi
+
+          echo "app_id=$APP_ID" >> $GITHUB_OUTPUT
+          echo "📋 Манифест: $MANIFEST_PATH"
+          echo "📋 App ID: $APP_ID"
+
+      # ========================================
+      # СБОРКА
+      # ========================================
+      - name: Build Flatpak
         run: |
           MANIFEST="${{ steps.vars.outputs.manifest_path }}"
           APP_ID="${{ steps.vars.outputs.app_id }}"
-          
-          echo "🔨 Начинаем сборку: $APP_ID (branch: stable)"
-          
-          # Добавлен флаг --default-branch=stable
-          flatpak-builder --repo=repo --force-clean --gpg-sign=$GPG_KEY_ID --install-deps-from=flathub --default-branch=stable build-dir "$MANIFEST"
-          
-          flatpak build-update-repo --generate-static-deltas --gpg-sign=$GPG_KEY_ID --title="Flat Store" repo
-          
-          GPG_PUBLIC_DATA=$(gpg --export --armor $GPG_KEY_ID | base64 -w 0)
+
+          echo "🔨 Сборка: $APP_ID (branch: $FLATPAK_BRANCH)"
+          echo "📅 Время: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+          flatpak-builder \
+            --repo=repo \
+            --force-clean \
+            --install-deps-from=flathub \
+            --default-branch=$FLATPAK_BRANCH \
+            build-dir "$MANIFEST"
+
+          echo "✅ Сборка завершена"
+
+      # ========================================
+      # СОЗДАНИЕ РЕПОЗИТОРИЯ (все метаданные)
+      # ========================================
+      - name: Create Repository Metadata
+        env:
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+        run: |
+          APP_ID="${{ steps.vars.outputs.app_id }}"
+
+          echo "📦 Создание метаданных репозитория..."
+
+          # Создаём summary с подписью
+          if [ -n "$GPG_KEY_ID" ]; then
+            flatpak build-update-repo \
+              --gpg-sign=$GPG_KEY_ID \
+              --title="Flat Store" \
+              repo
+
+            echo "✅ Summary создан и подписан"
+          else
+            flatpak build-update-repo --title="Flat Store" repo
+            echo "⚠️ Summary создан без подписи"
+          fi
+
+          # Создаём flatpakref файл для приложения
+          GPG_PUBLIC_DATA=""
+          if [ -n "$GPG_KEY_ID" ]; then
+            GPG_PUBLIC_DATA=$(gpg --export --armor $GPG_KEY_ID 2>/dev/null | base64 -w 0)
+          fi
+
           mkdir -p repo/apps
-          FLATPAKREF_FILE="repo/apps/$(basename "$APP_ID" | tr '.' '-').flatpakref"
-          
-          # Здесь изменено /master на /stable
+          FLATPAKREF_FILE="repo/apps/$(echo "$APP_ID" | tr '.' '-').flatpakref"
+
           cat <<EOF > "$FLATPAKREF_FILE"
           [Flatpak Ref]
-          Name=$APP_ID/x86_64/stable
+          Name=$APP_ID/x86_64/$FLATPAK_BRANCH
           RepoName=Flat Store
           Url=https://flatstore.ikhlasulov.site/flatstore/
           RuntimeRepo=https://dl.flathub.org/repo/flathub.flatpakrepo
           IsRuntime=false
           SuggestRemoteName=flatstore
-          GPGKey=$GPG_PUBLIC_DATA
+          ${GPG_PUBLIC_DATA:+GPGKey=$GPG_PUBLIC_DATA}
           EOF
-          
-          echo "✅ Сборка успешно завершена."
 
+          echo "✅ flatpakref создан: $FLATPAKREF_FILE"
+
+      # ========================================
+      # ВЕРИФИКАЦИЯ (критически важно!)
+      # ========================================
+      - name: Verify Repository Integrity
+        id: verify
+        run: |
+          echo "🔍 Проверка целостности репозитория..."
+          echo ""
+
+          ERRORS=0
+          REFS_OK=0
+          REFS_TOTAL=0
+
+          # --- Проверка всех refs ---
+          echo "📋 Проверка refs..."
+
+          for ref_file in $(find repo/refs/heads -type f 2>/dev/null); do
+            REFS_TOTAL=$((REFS_TOTAL + 1))
+
+            # Получаем относительный путь
+            ref_name="${ref_file#repo/refs/heads/}"
+
+            # Читаем хеш коммита
+            commit=$(cat "$ref_file" 2>/dev/null | tr -d '\n\r')
+
+            # Пропускаем пустые файлы
+            if [ -z "$commit" ]; then
+              echo "  ⚠️ Пустой ref: $ref_name (удаляем)"
+              rm -f "$ref_file"
+              continue
+            fi
+
+            # Проверяем формат (64 hex символа)
+            if [[ ! "$commit" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "  ❌ Неверный хеш в ref: $ref_name"
+              ERRORS=$((ERRORS + 1))
+              continue
+            fi
+
+            # Проверяем существование commit объекта
+            prefix="${commit:0:2}"
+            suffix="${commit:2}"
+            obj_file="repo/objects/$prefix/$suffix.commit"
+
+            if [ -f "$obj_file" ]; then
+              echo "  ✅ $ref_name -> ${commit:0:12}..."
+              REFS_OK=$((REFS_OK + 1))
+            else
+              echo "  ❌ $ref_name -> ${commit:0:12}... (ОБЪЕКТ НЕ НАЙДЕН!)"
+              echo "     Ожидаемый путь: $obj_file"
+              ERRORS=$((ERRORS + 1))
+            fi
+          done
+
+          echo ""
+          echo "📊 Refs: $REFS_OK/$REFS_TOTAL валидных"
+
+          # --- Проверка summary ---
+          echo ""
+          echo "📋 Проверка summary..."
+
+          if [ -f "repo/summary" ]; then
+            SIZE=$(stat -c%s "repo/summary" 2>/dev/null || echo "0")
+            if [ "$SIZE" -gt 0 ]; then
+              echo "  ✅ summary существует ($SIZE байт)"
+            else
+              echo "  ❌ summary пуст"
+              ERRORS=$((ERRORS + 1))
+            fi
+          else
+            echo "  ❌ summary не найден"
+            ERRORS=$((ERRORS + 1))
+          fi
+
+          # --- Проверка подписи ---
+          if [ -f "repo/summary.sig" ]; then
+            echo "  ✅ summary.sig существует"
+          else
+            echo "  ⚠️ summary.sig не найден (репозиторий не подписан)"
+          fi
+
+          # --- Проверка файлов приложения ---
+          APP_ID="${{ steps.vars.outputs.app_id }}"
+          echo ""
+          echo "📋 Проверка приложения $APP_ID..."
+
+          APP_REF="repo/refs/heads/app/$APP_ID/x86_64/$FLATPAK_BRANCH"
+          if [ -f "$APP_REF" ]; then
+            echo "  ✅ Ref приложения существует"
+
+            # Получаем хеш и проверяем объект
+            APP_COMMIT=$(cat "$APP_REF" | tr -d '\n\r')
+            APP_OBJ="repo/objects/${APP_COMMIT:0:2}/${APP_COMMIT:2}.commit"
+
+            if [ -f "$APP_OBJ" ]; then
+              echo "  ✅ Commit объект приложения существует"
+            else
+              echo "  ❌ Commit объект приложения НЕ найден: $APP_OBJ"
+              ERRORS=$((ERRORS + 1))
+            fi
+          else
+            echo "  ❌ Ref приложения не найден: $APP_REF"
+            ERRORS=$((ERRORS + 1))
+          fi
+
+          # --- Статистика ---
+          echo ""
+          echo "📊 Статистика репозитория:"
+          echo "  • Commit объектов: $(find repo/objects -name '*.commit' 2>/dev/null | wc -l)"
+          echo "  • Ref файлов: $(find repo/refs/heads -type f 2>/dev/null | wc -l)"
+          echo "  • Общий размер: $(du -sh repo 2>/dev/null | cut -f1)"
+
+          # --- Результат ---
+          echo ""
+          echo "errors=$ERRORS" >> $GITHUB_OUTPUT
+          echo "refs_ok=$REFS_OK" >> $GITHUB_OUTPUT
+          echo "refs_total=$REFS_TOTAL" >> $GITHUB_OUTPUT
+
+          if [ $ERRORS -gt 0 ]; then
+            echo ""
+            echo "═══════════════════════════════════════════════════════"
+            echo "❌ ОБНАРУЖЕНО ОШИБОК: $ERRORS"
+            echo "❌ ДЕПЛОЙ ОТМЕНЁН! Репозиторий некорректен."
+            echo "═══════════════════════════════════════════════════════"
+            exit 1
+          fi
+
+          echo ""
+          echo "✅ Верификация пройдена успешно!"
+
+      # ========================================
+      # ДЕПЛОЙ (только если верификация успешна)
+      # ========================================
       - name: Deploy via FTP
+        if: success()
         env:
           REMOTE_USER: ${{ secrets.REMOTE_USER }}
           REMOTE_PASSWORD: ${{ secrets.REMOTE_PASSWORD }}
@@ -114,12 +311,20 @@ jobs:
           REMOTE_PATH: ${{ secrets.REMOTE_PATH }}
           REMOTE_PORT: ${{ secrets.REMOTE_PORT }}
         run: |
-          echo "🚀 Подключение к FTP серверу $REMOTE_HOST..."
-          
-          lftp -u "$REMOTE_USER","$REMOTE_PASSWORD" -p "${REMOTE_PORT:-21}" "$REMOTE_HOST" <<EOF
+          APP_ID="${{ steps.vars.outputs.app_id }}"
+
+          echo "🚀 Деплой на $REMOTE_HOST"
+          echo "📅 Время: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "📦 Приложение: $APP_ID"
+          echo "📂 Удалённый путь: $REMOTE_PATH"
+
+          # Полная синхронизация с удалением старых файлов
+          lftp -u "$REMOTE_USER","$REMOTE_PASSWORD" -p "${REMOTE_PORT:-21}" "$REMOTE_HOST" <<LFTP_SCRIPT
           debug 3
-          set net:timeout 10
-          set net:max-retries 2
+          set net:timeout 30
+          set net:max-retries 3
+          set net:reconnect-interval-base 5
+          set net:reconnect-interval-multiplier 2
           set ftp:passive-mode on
           set ftp:ignore-pasv-address yes
           set ftp:prefer-epsv no
@@ -128,8 +333,113 @@ jobs:
           set ftp:ssl-protect-data no
           set ftp:ssl-protect-list no
           set ssl:verify-certificate no
+
+          # Создаём директорию если не существует
+          mkdir -p "$REMOTE_PATH"
+
+          # Полная синхронизация с удалением старых файлов
           mirror -R --delete --parallel=2 --ignore-time ./repo/ "$REMOTE_PATH"
+
           quit
-          EOF
-          
-          echo "🎉 Деплой завершен! Приложение доступно на сайте."
+          LFTP_SCRIPT
+
+          DEPLOY_STATUS=$?
+          if [ $DEPLOY_STATUS -ne 0 ]; then
+            echo "❌ Ошибка деплоя: $DEPLOY_STATUS"
+            exit 1
+          fi
+
+          echo "✅ Файлы загружены"
+
+      # ========================================
+      # ПОСТ-ПРОВЕРКА ДЕПЛОЯ
+      # ========================================
+      - name: Verify Deployment
+        if: success()
+        run: |
+          APP_ID="${{ steps.vars.outputs.app_id }}"
+          BASE_URL="https://flatstore.ikhlasulov.site/flatstore"
+
+          echo "🔍 Проверка деплоя по HTTP..."
+
+          # Функция проверки HTTP
+          check_url() {
+            local url="$1"
+            local name="$2"
+            local code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 30 "$url" 2>/dev/null || echo "000")
+
+            if [ "$code" = "200" ]; then
+              echo "  ✅ $name (HTTP $code)"
+              return 0
+            else
+              echo "  ❌ $name (HTTP $code)"
+              return 1
+            fi
+          }
+
+          echo ""
+          echo "📋 Проверка файлов:"
+
+          # Проверяем основные файлы
+          check_url "$BASE_URL/summary" "summary" || true
+          check_url "$BASE_URL/summary.sig" "summary.sig" || true
+          check_url "$BASE_URL/flatstore.flatpakrepo" "flatstore.flatpakrepo" || true
+
+          # Проверяем ref приложения
+          REF_URL="$BASE_URL/refs/heads/app/$APP_ID/x86_64/$FLATPAK_BRANCH"
+          if check_url "$REF_URL" "ref приложения"; then
+            # Получаем хеш коммита
+            COMMIT=$(curl -s "$REF_URL" 2>/dev/null | tr -d '\n\r')
+
+            if [ -n "$COMMIT" ] && [[ "$COMMIT" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "     Commit: ${COMMIT:0:12}..."
+
+              # Проверяем commit объект
+              COMMIT_URL="$BASE_URL/objects/${COMMIT:0:2}/${COMMIT:2}.commit"
+              check_url "$COMMIT_URL" "commit объект" || echo "     ⚠️ Если ошибка - подождите несколько минут и повторите"
+            fi
+          fi
+
+          echo ""
+          echo "═══════════════════════════════════════════════════════"
+          echo "🎉 ДЕПЛОЙ ЗАВЕРШЁН!"
+          echo "═══════════════════════════════════════════════════════"
+          echo ""
+          echo "📦 Для установки:"
+          echo "   flatpak remote-add --if-not-exists flatstore \\"
+          echo "       https://flatstore.ikhlasulov.site/flatstore/flatstore.flatpakrepo"
+          echo "   flatpak install $APP_ID"
+
+      # ========================================
+      # SUMMARY
+      # ========================================
+      - name: Create Job Summary
+        if: always()
+        run: |
+          APP_ID="${{ steps.vars.outputs.app_id }}"
+          MANIFEST="${{ steps.vars.outputs.manifest_path }}"
+          STATUS="${{ job.status }}"
+          ERRORS="${{ steps.verify.outputs.errors }}"
+
+          echo "## 📦 Результат сборки" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Параметр | Значение |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|----------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **App ID** | \`$APP_ID\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Манифест** | \`$MANIFEST\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Ветка** | \`$FLATPAK_BRANCH\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Статус** | ${STATUS} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Время** | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$STATUS" = "success" ]; then
+            echo "### ✅ Установка" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+            echo "flatpak remote-add --if-not-exists flatstore \\" >> $GITHUB_STEP_SUMMARY
+            echo "    https://flatstore.ikhlasulov.site/flatstore/flatstore.flatpakrepo" >> $GITHUB_STEP_SUMMARY
+            echo "flatpak install $APP_ID" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ Ошибки" >> $GITHUB_STEP_SUMMARY
+            echo "Проверьте логи workflow для деталей." >> $GITHUB_STEP_SUMMARY
+          fi
